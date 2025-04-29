@@ -1,0 +1,190 @@
+---
+title: "Machine Learning"
+format: pdf
+editor: visual
+---
+
+# Loading the necessary files
+
+```{r warning = FALSE, message = FALSE}
+library(readr)
+library(knitr)
+library(readxl)
+
+labeled_annotated_data <- read_csv("Data/Labeled_News_Dataset__First_1000_Rows_.csv")
+kable(head(labeled_annotated_data, 5), caption = "First 5 Rows of Labeled Annotated Data")
+
+gtd <- read_excel("Data/globalterrorismdb_0522dist.xlsx")
+kable(head(gtd, 5), caption = "First 5 Rows of Global Terrorism Database")
+```
+
+# Data Cleaning
+
+```{r warning = FALSE, message = FALSE}
+library(tidyverse)
+library(tm)
+library(SnowballC)
+library(caret)
+library(text2vec)
+library(rpart)
+library(dplyr)
+
+df <- labeled_annotated_data %>%
+  mutate(text = paste(headline, snippet, sep = " ")) %>%
+  filter(!is.na(text))
+
+clean_text <- function(x){
+    x <- tolower(x)
+    x <- removePunctuation(x)
+    x <- removeNumbers(x)
+    x <- removeWords(x, stopwords('en'))
+    x <- stripWhitespace(x)
+    x <- wordStem(x)
+    return(x)
+}
+
+df$text_clean <- sapply(df$text, clean_text)
+
+head(df$text_clean, 10)
+```
+
+# Cross Validation & Training
+
+```{r}
+# Load required libraries
+library(tidyverse)
+library(tm)
+library(SnowballC)
+library(text2vec)
+library(caret)
+library(rpart)
+library(stringr)
+
+# --- Step 1: Preprocess Labeled Data ---
+df_labeled <- df %>%
+  filter(!is.na(framing_label) & framing_label != "") %>%
+  mutate(
+    framing_label = str_replace_all(framing_label, " ", "_"),
+    framing_label = as.factor(framing_label)
+  )
+
+# --- Step 2: Train-Test Split ---
+set.seed(42)
+trainIndex <- createDataPartition(df_labeled$framing_label, p = 0.8, list = FALSE)
+train_df <- df_labeled[trainIndex, ]
+test_df  <- df_labeled[-trainIndex, ]
+
+# --- Step 3: TF-IDF Vectorization ---
+train_it <- itoken(train_df$text_clean, progressbar = FALSE)
+vocab <- create_vocabulary(train_it)
+vocab <- prune_vocabulary(vocab, term_count_min = 5)  # keep only frequent terms
+vectorizer <- vocab_vectorizer(vocab)
+
+train_dtm <- create_dtm(train_it, vectorizer)
+tfidf <- TfIdf$new()
+train_tfidf <- fit_transform(train_dtm, tfidf)
+
+test_it <- itoken(test_df$text_clean, progressbar = FALSE)
+test_dtm <- create_dtm(test_it, vectorizer)
+test_tfidf <- transform(test_dtm, tfidf)
+
+# --- Step 4: Convert to DataFrame & Fix Columns ---
+train_matrix <- as.data.frame(as.matrix(train_tfidf))
+test_matrix  <- as.data.frame(as.matrix(test_tfidf))
+
+train_matrix$framing_label <- train_df$framing_label
+test_matrix$framing_label  <- test_df$framing_label
+
+# Fix column names
+colnames(train_matrix) <- make.names(colnames(train_matrix))
+colnames(test_matrix)  <- make.names(colnames(test_matrix))
+
+# Remove duplicated columns
+train_matrix <- train_matrix[, !duplicated(colnames(train_matrix))]
+test_matrix  <- test_matrix[, !duplicated(colnames(test_matrix))]
+
+# --- Step 5: Prepare x/y for Training ---
+x_train <- train_matrix %>% select(-framing_label)
+y_train <- train_matrix$framing_label
+
+x_test  <- test_matrix %>% select(-framing_label)
+y_test  <- test_matrix$framing_label
+
+# --- Step 6: Cross-Validation Setup ---
+cv_control <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  verboseIter = TRUE,
+  savePredictions = "final"
+)
+
+# --- Step 7: Train Decision Tree ---
+dt_model <- train(
+  x = x_train,
+  y = y_train,
+  method = "rpart",
+  trControl = cv_control
+)
+
+# --- Step 8: Predict and Evaluate ---
+predictions <- predict(dt_model, newdata = x_test)
+confusionMatrix(predictions, y_test)
+```
+
+```{r warning=FALSE, message=FALSE, fig.width=10}
+# Load the package
+library(rpart.plot)
+
+# Plot the decision tree
+rpart.plot(dt_model$finalModel,
+           type = 4,       # fancy splits
+           extra = 104,    # show probs and labels
+           tweak = 1.2,    # size adjustment
+           fallen.leaves = TRUE,
+           main = "Framing Label Decision Tree")
+```
+
+# Labeling the remaining data
+
+```{r}
+# --- Step 1: Filter only unlabeled rows ---
+df_unlabeled <- df %>%
+  filter(is.na(framing_label) | framing_label == "")
+
+# --- Step 2: Vectorize using the SAME TF-IDF model ---
+unlabeled_it <- itoken(df_unlabeled$text_clean, progressbar = FALSE)
+unlabeled_dtm <- create_dtm(unlabeled_it, vectorizer)
+unlabeled_tfidf <- transform(unlabeled_dtm, tfidf)
+
+# --- Step 3: Convert to dataframe and fix column names ---
+unlabeled_matrix <- as.data.frame(as.matrix(unlabeled_tfidf))
+colnames(unlabeled_matrix) <- make.names(colnames(unlabeled_matrix))
+unlabeled_matrix <- unlabeled_matrix[, !duplicated(colnames(unlabeled_matrix))]
+
+# --- Step 4: Align columns with training matrix ---
+# Keep only the columns that the model expects
+expected_cols <- colnames(x_train)
+missing_cols <- setdiff(expected_cols, colnames(unlabeled_matrix))
+for (col in missing_cols) {
+  unlabeled_matrix[[col]] <- 0  # add missing columns with zeros
+}
+unlabeled_matrix <- unlabeled_matrix[, expected_cols]
+
+# --- Step 5: Predict using trained model ---
+predicted_labels <- predict(dt_model, newdata = unlabeled_matrix)
+
+# --- Step 6: Combine with original data ---
+df_unlabeled$framing_label <- predicted_labels
+
+# Optional: Combine with labeled data
+df_final <- bind_rows(
+  df_labeled,
+  df_unlabeled
+)
+```
+
+```{r}
+df_final <- df_final %>% select(headline, snippet, date, text_clean, keyword, framing_label)
+write.csv(df_final, 'framing_label_newspaper.csv')
+```

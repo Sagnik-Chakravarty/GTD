@@ -188,3 +188,319 @@ df_final <- bind_rows(
 df_final <- df_final %>% select(headline, snippet, date, text_clean, keyword, framing_label)
 write.csv(df_final, 'framing_label_newspaper.csv')
 ```
+
+# GTI
+
+```{r}
+gti_countries <- gtd %>%
+  distinct(country_txt) %>%
+  pull(country_txt)
+# Combine headline and snippet into one text field
+df_final <- df_final %>%
+  mutate(full_text = paste(headline, snippet, sep = " "))  # your existing data
+
+# Try to assign country based on keyword match
+df_final$country <- sapply(df_final$full_text, function(txt) {
+  match <- gti_countries[str_detect(txt, fixed(gti_countries, ignore_case = TRUE))]
+  if (length(match) > 0) return(match[1]) else return(NA)
+})
+write.csv(df_final, 'framing_label_newspaper.csv')
+```
+
+# My own GTI
+
+```{r}
+gtd_df <- gtd %>%
+  mutate(
+    nkill = ifelse(is.na(nkill), 0, nkill),
+    nwound = ifelse(is.na(nwound), 0, nwound),
+    nhostkid = ifelse(is.na(nhostkid), 0, nhostkid)
+  )
+gti_like_scores <- gtd_df %>%
+  group_by(country_txt) %>%
+  summarise(
+    incidents = n(),
+    fatalities = sum(nkill, na.rm = TRUE),
+    injuries = sum(nwound, na.rm = TRUE),
+    hostages = sum(nhostkid, na.rm = TRUE)
+  ) %>%
+  ungroup()
+# Normalize each column (0 to 10)
+normalize <- function(x) {
+  if (max(x) == 0) return(rep(0, length(x)))
+  return(10 * (x - min(x)) / (max(x) - min(x)))
+}
+
+gti_like_scores <- gti_like_scores %>%
+  mutate(
+    norm_incidents = normalize(incidents),
+    norm_fatalities = normalize(fatalities),
+    norm_injuries = normalize(injuries),
+    norm_hostages = normalize(hostages),
+    gti_score = 0.3 * norm_incidents +
+                0.3 * norm_fatalities +
+                0.2 * norm_injuries +
+                0.2 * norm_hostages
+  )
+```
+
+```{r}
+# Load libraries
+library(dplyr)
+library(tidyr)
+library(caret)
+library(randomForest)
+
+# ----------------------------
+# Step 1: Aggregate Framing by Country (NO source)
+# ----------------------------
+
+framing_df <- read.csv("framing_label_newspaper.csv")
+framing_df$country <- trimws(framing_df$country)
+
+framing_summary <- framing_df %>%
+  filter(!is.na(country) & !is.na(framing_label)) %>%
+  group_by(country, framing_label) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = framing_label, values_from = n, values_fill = 0) %>%
+  mutate(
+    total_articles = rowSums(across(where(is.numeric))),
+    terrorism_ratio = if ("Terrorism" %in% names(.)) Terrorism / (total_articles + 1) else 0,
+    state_violence_ratio = if ("State_Violence" %in% names(.)) State_Violence / (total_articles + 1) else 0
+  )
+
+# ----------------------------
+# Step 2: Join GTD-Based Scores
+# ----------------------------
+
+gti_like_scores$country <- gti_like_scores$country_txt
+
+gti_joined <- gti_like_scores %>%
+  left_join(framing_summary, by = "country")
+
+# ----------------------------
+# Step 3: Prepare ML Dataset
+# ----------------------------
+
+df_ml <- gti_joined %>%
+  select(
+    -country_txt, -country,
+    -norm_incidents, -norm_fatalities, -norm_injuries, -norm_hostages
+  ) %>%
+  select(where(is.numeric)) %>%
+  drop_na()
+
+# ----------------------------
+# Step 4: Train/Test Split
+# ----------------------------
+
+set.seed(640)
+trainIndex <- createDataPartition(df_ml$gti_score, p = 0.8, list = FALSE)
+train_data <- df_ml[trainIndex, ]
+test_data  <- df_ml[-trainIndex, ]
+
+# ----------------------------
+# Step 5: Train Model (Random Forest)
+# ----------------------------
+
+cv_control <- trainControl(method = "cv", number = 10, verboseIter = TRUE)
+
+model <- train(
+  gti_score ~ ., 
+  data = train_data,
+  method = "rf",
+  trControl = cv_control
+)
+
+# ----------------------------
+# Step 6: Evaluate Model
+# ----------------------------
+
+predictions <- predict(model, newdata = test_data)
+postResample(predictions, test_data$gti_score)
+
+# ----------------------------
+# Step 7: Predict for Full Dataset
+# ----------------------------
+
+gti_joined$ml_predicted_score <- NA
+gti_joined$ml_predicted_score[which(complete.cases(df_ml))] <- predict(model, newdata = df_ml)
+
+```
+
+```{r}
+ranking_df <- gti_joined %>%
+  select(country = country_txt, gti_score, ml_predicted_score) %>%
+  drop_na()
+ranking_df <- ranking_df %>%
+  mutate(
+    gti_rank = rank(-gti_score, ties.method = "min"),
+    ml_rank = rank(-ml_predicted_score, ties.method = "min"),
+    rank_difference = gti_rank - ml_rank
+  ) %>%
+  arrange(ml_rank)
+```
+
+```{r}
+write.csv(ranking_df, 'gti_ranking.csv')
+write.csv(gti_joined, 'gti_score_calculated.csv')
+```
+
+# Visualization
+
+```{r}
+# Feature importance
+library(caret)
+importance <- varImp(model)
+plot(importance, top = 10, main = "Top 10 Features Influencing GTI Score")
+```
+
+```{r}
+library(ggplot2)
+
+# Predict on test data and compute residuals
+test_data$predicted <- predict(model, newdata = test_data)
+test_data$residual <- test_data$predicted - test_data$gti_score
+
+# Residual plot
+ggplot(test_data, aes(x = predicted, y = residual)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residuals vs Predicted GTI Score",
+       x = "Predicted GTI Score",
+       y = "Residual (Predicted - True)") +
+  theme_minimal()
+```
+
+```{r}
+library(ggplot2)
+
+gti_joined %>%
+  drop_na(ml_predicted_score) %>%
+  top_n(15, wt = ml_predicted_score) %>%
+  ggplot(aes(x = reorder(country_txt, ml_predicted_score), y = ml_predicted_score)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 15 Countries by ML-Predicted GTI Score",
+       x = "Country",
+       y = "ML GTI Score") +
+  theme_minimal()
+```
+
+```{r}
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(dplyr)
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Join ML GTI score
+map_data <- world %>%
+  left_join(gti_joined, by = c("name" = "country_txt"))
+
+# Plot ML GTI map
+ggplot(map_data) +
+  geom_sf(aes(fill = ml_predicted_score), color = "black", size = 0.1) +
+  scale_fill_viridis_c(option = "plasma", na.value = "gray90", name = "ML GTI Score") +
+  theme_minimal() +
+  labs(title = "Global Map of ML-Predicted GTI Score")
+
+```
+
+```{r}
+# Add difference column first
+map_data$gti_difference <- map_data$ml_predicted_score - map_data$gti_score
+
+ggplot(map_data) +
+  geom_sf(aes(fill = gti_difference), color = "black", size = 0.1) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, na.value = "gray90") +
+  theme_minimal() +
+  labs(title = "Difference: ML GTI - Original GTI",
+       fill = "Score Gap")
+
+```
+
+```{r}
+ggplot(gti_joined, aes(x = terrorism_ratio, y = ml_predicted_score)) +
+  geom_point(color = "darkgreen") +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Effect of Media Terrorism Ratio on ML GTI Score",
+       x = "Terrorism Framing Ratio",
+       y = "ML GTI Score")
+
+```
+
+# Biasness and Interpretability
+
+```{r fig.width=10}
+library(DALEX)
+
+# Build explainer from caret model
+explainer <- explain(
+  model$finalModel,
+  data = train_data %>% select(-gti_score),
+  y = train_data$gti_score,
+  label = "GTI_RF"
+)
+
+# Choose one country to explain (e.g., India)
+india_row <- gti_joined[gti_joined$country == "India", ] %>%
+  select(where(is.numeric)) %>%
+  drop_na()
+
+# Local explanation (break-down method)
+bd <- predict_parts(explainer, new_observation = india_row, type = "break_down")
+plot(bd) + ggtitle("Feature Contribution for India (Local Explanation)")
+
+```
+
+```{r fig.width=10}
+gti_joined$region <- case_when(
+  gti_joined$country %in% c("India", "Pakistan", "Yemen", "Afghanistan") ~ "Global South",
+  gti_joined$country %in% c("United States", "Germany", "France", "UK") ~ "Global North",
+  TRUE ~ "Other"
+)
+
+```
+
+```{r}
+# Binarize for classification fairness
+gti_joined$gti_label <- ifelse(gti_joined$gti_score > median(gti_joined$gti_score, na.rm = TRUE), "High", "Low")
+gti_joined$ml_label <- ifelse(gti_joined$ml_predicted_score > median(gti_joined$ml_predicted_score, na.rm = TRUE), "High", "Low")
+```
+
+```{r}
+library(forcats)
+
+south$ml_label <- factor(south$ml_label, levels = c("Low", "High"))
+south$gti_label <- factor(south$gti_label, levels = c("Low", "High"))
+
+confusionMatrix(south$ml_label, south$gti_label)
+
+
+```
+
+```{r}
+library(pROC)
+
+# Example for Global South
+regions <- unique(gti_joined$region)
+roc_list <- list()
+
+for (r in regions) {
+  grp <- gti_joined[gti_joined$region == r, ]
+  if (length(unique(grp$gti_label)) == 2) {
+    roc_list[[r]] <- roc(grp$gti_label, grp$ml_predicted_score, levels = c("Low", "High"))
+  } else {
+    cat(paste("Skipping", r, "- only one class present.\n"))
+  }
+}
+
+# Plot combined ROC curves
+ggroc(roc_list) + 
+  geom_abline(linetype = "dashed") + 
+  labs(title = "ROC Curves by Region", x = "1 - Specificity", y = "Sensitivity")
+
+```

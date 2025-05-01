@@ -5,7 +5,7 @@ This repository contains the code, data pipeline, and visualizations for an inte
 
 ---
 
-## 🔍 Overview
+## Overview
 
 **Why this project?**
 
@@ -15,7 +15,7 @@ The original GTI does not consider how terrorism is portrayed in the media—lea
 
 ---
 
-## 🧠 Key Features
+## Key Features
 
 - **Framing Classifier**: Trained a decision tree using 1,000 hand-labeled news articles to identify five framing types: `Terrorism`, `State Violence`, `Insurgency`, `Freedom Fighter`, `Neutral`.
 - **GTI Modeling**: Built a random forest regression model combining GTD indicators and aggregated framing ratios per country.
@@ -23,15 +23,3 @@ The original GTI does not consider how terrorism is portrayed in the media—lea
 - **Visual Outputs**: Global GTI maps, rank comparisons, residuals, ROC curves, and feature importance plots.
 
 ---
-
-## 📂 Project Structure
-
-```text
-.
-├── data/                   # Cleaned datasets and GTI ranking CSV
-├── notebooks/             # Jupyter/Rmd files for analysis and training
-├── scripts/               # Core scripts for scraping, labeling, and modeling
-├── figures/               # All plots and maps used in the paper
-├── models/                # Trained models and prediction outputs
-├── paper/                 # Final LaTeX report and PDF
-└── README.md              # This file
